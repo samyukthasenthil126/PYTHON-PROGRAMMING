@@ -1,1 +1,720 @@
+import csv
+import io
+import sqlite3
+import time
+import logging
+import statistics
+from collections import defaultdict, Counter
+
+# Matplotlib is optional
+try:
+    import matplotlib.pyplot as plt
+    CHARTS_AVAILABLE = True
+except ImportError:
+    CHARTS_AVAILABLE = False
+
+
+# =====================================================
+# 1. SAMPLE CSV DATA
+# =====================================================
+
+RAW = """station,date,pm25
+Adyar,2026-10-01,48
+Adyar,2026-10-02,NA
+Adyar,2026-10-03,
+Guindy,2026-10-01,95
+Guindy,2026-10-02,-5
+Guindy,2026-10-03,121
+"""
+
+logging.basicConfig(level=logging.WARNING,
+                    format="%(levelname)s: %(message)s")
+
+
+# =====================================================
+# 2. DATA ACQUISITION AND CLEANING
+# =====================================================
+
+def load_clean(text):
+
+    rows = []
+    reader = csv.DictReader(io.StringIO(text))
+
+    required = ["station", "date", "pm25"]
+
+    if not reader.fieldnames:
+        raise ValueError("CSV file has no header")
+
+    for column in required:
+        if column not in reader.fieldnames:
+            raise ValueError("Missing column: " + column)
+
+    seen = set()
+
+    for row_number, row in enumerate(reader, start=2):
+
+        station = (row["station"] or "").strip().title()
+        date = (row["date"] or "").strip()
+        value = (row["pm25"] or "").strip()
+
+        if not station or not date:
+            logging.warning("Missing station/date at row %d",
+                            row_number)
+            continue
+
+        try:
+            time.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            logging.warning("Invalid date at row %d", row_number)
+            continue
+
+        if value == "" or value.upper() in ("NA", "N/A", "NULL"):
+            logging.warning("Missing PM2.5 at row %d", row_number)
+            continue
+
+        try:
+            pm25 = float(value)
+        except ValueError:
+            logging.warning("Invalid number at row %d", row_number)
+            continue
+
+        if pm25 < 0:
+            logging.warning("Negative reading at row %d", row_number)
+            continue
+
+        key = (station, date)
+
+        if key in seen:
+            logging.warning("Duplicate row %d", row_number)
+            continue
+
+        seen.add(key)
+        rows.append((station, date, pm25))
+
+    return rows
+
+
+# =====================================================
+# 3. MIN-MAX NORMALISATION
+# =====================================================
+
+def min_max(values):
+
+    values = list(values)
+
+    if not values:
+        return []
+
+    minimum = min(values)
+    maximum = max(values)
+
+    if maximum == minimum:
+        return [0.0 for value in values]
+
+    result = []
+
+    for value in values:
+        scaled = (value - minimum) / (maximum - minimum)
+        result.append(round(scaled, 3))
+
+    return result
+
+
+# =====================================================
+# 4. Z-SCORE STANDARDISATION
+# =====================================================
+
+def z_score(values):
+
+    values = list(values)
+
+    if not values:
+        return []
+
+    if len(values) < 2:
+        return [0.0 for value in values]
+
+    mean = statistics.mean(values)
+    sd = statistics.pstdev(values)
+
+    if sd == 0:
+        return [0.0 for value in values]
+
+    return [
+        round((value - mean) / sd, 3)
+        for value in values
+    ]
+
+
+# =====================================================
+# 5. SQLITE DATABASE
+# =====================================================
+
+def create_database(rows):
+
+    con = sqlite3.connect(":memory:")
+    cur = con.cursor()
+
+    cur.execute("""
+    CREATE TABLE stations(
+        station_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        station_name TEXT UNIQUE NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE readings(
+        reading_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        station_id INTEGER NOT NULL,
+        reading_date TEXT NOT NULL,
+        pm25 REAL NOT NULL,
+        FOREIGN KEY(station_id)
+        REFERENCES stations(station_id),
+        UNIQUE(station_id, reading_date)
+    )
+    """)
+
+    cur.execute("""
+    CREATE INDEX idx_station_date
+    ON readings(station_id, reading_date)
+    """)
+
+    for station, date, pm25 in rows:
+
+        cur.execute("""
+        INSERT OR IGNORE INTO stations(station_name)
+        VALUES(?)
+        """, (station,))
+
+        cur.execute("""
+        SELECT station_id FROM stations
+        WHERE station_name=?
+        """, (station,))
+
+        station_id = cur.fetchone()[0]
+
+        cur.execute("""
+        INSERT INTO readings(station_id, reading_date, pm25)
+        VALUES(?,?,?)
+        """, (station_id, date, pm25))
+
+    con.commit()
+
+    return con
+
+
+# =====================================================
+# 6. SQL QUERY 1
+# AVERAGE PM2.5 AT ADYAR IN OCTOBER
+# =====================================================
+
+def query_one(con):
+
+    cur = con.cursor()
+
+    cur.execute("""
+    SELECT AVG(r.pm25)
+    FROM readings r
+    JOIN stations s
+    ON r.station_id=s.station_id
+    WHERE s.station_name=?
+    AND r.reading_date>=?
+    AND r.reading_date<?
+    """, ("Adyar", "2026-10-01", "2026-11-01"))
+
+    result = cur.fetchone()[0]
+
+    print("\nAdyar October Average:")
+
+    if result is None:
+        print("No readings available")
+    else:
+        print(round(result, 2))
+
+
+# =====================================================
+# 7. SQL QUERY 2
+# AVERAGE PM2.5 BY STATION
+# =====================================================
+
+def query_two(con):
+
+    cur = con.cursor()
+
+    cur.execute("""
+    SELECT s.station_name, AVG(r.pm25)
+    FROM readings r
+    JOIN stations s
+    ON r.station_id=s.station_id
+    GROUP BY s.station_id
+    ORDER BY AVG(r.pm25) DESC
+    """)
+
+    print("\nAverage PM2.5 by Station:")
+
+    for station, average in cur.fetchall():
+        print(station, ":", round(average, 2))
+
+
+# =====================================================
+# 8. SQL QUERY 3
+# DAILY SUMMARY
+# =====================================================
+
+def query_three(con):
+
+    cur = con.cursor()
+
+    cur.execute("""
+    SELECT s.station_name,
+           r.reading_date,
+           MIN(r.pm25),
+           MAX(r.pm25),
+           AVG(r.pm25),
+           COUNT(r.pm25)
+    FROM readings r
+    JOIN stations s
+    ON r.station_id=s.station_id
+    GROUP BY s.station_id, r.reading_date
+    ORDER BY s.station_name, r.reading_date
+    """)
+
+    print("\nDaily Summary:")
+
+    print("Station | Date | Min | Max | Mean | Count")
+
+    for row in cur.fetchall():
+        print(row)
+
+
+# =====================================================
+# 9. PYTHON DAILY SUMMARY
+# =====================================================
+
+def python_summary(rows):
+
+    data = defaultdict(list)
+
+    for station, date, pm25 in rows:
+        data[(station, date)].append(pm25)
+
+    print("\nPython Daily Summary:")
+
+    for key in sorted(data):
+
+        values = data[key]
+
+        print(
+            key,
+            "Minimum:", min(values),
+            "Maximum:", max(values),
+            "Mean:", round(statistics.mean(values), 2),
+            "Count:", len(values)
+        )
+
+
+# =====================================================
+# 10. VISUALISATION
+# =====================================================
+
+def visualise(rows):
+
+    if not CHARTS_AVAILABLE:
+        print("\nMatplotlib not installed.")
+        print("Install using: pip install matplotlib")
+        return
+
+    if not rows:
+        return
+
+    dates_data = defaultdict(list)
+    stations_data = defaultdict(list)
+
+    for station, date, pm25 in rows:
+
+        dates_data[date].append(pm25)
+        stations_data[station].append(pm25)
+
+    # LINE CHART
+
+    dates = sorted(dates_data)
+
+    averages = [
+        statistics.mean(dates_data[d])
+        for d in dates
+    ]
+
+    plt.figure()
+
+    plt.plot(dates, averages, marker="o")
+
+    plt.title("Monthly PM2.5 Trend")
+    plt.xlabel("Date")
+    plt.ylabel("PM2.5 (micrograms/m3)")
+
+    plt.xticks(rotation=30)
+    plt.tight_layout()
+
+    plt.savefig("PM25_Trend.png")
+    plt.show()
+
+    # BAR CHART
+
+    stations = sorted(stations_data)
+
+    station_averages = [
+        statistics.mean(stations_data[s])
+        for s in stations
+    ]
+
+    plt.figure()
+
+    plt.bar(stations, station_averages)
+
+    plt.title("Station Comparison")
+    plt.xlabel("Station")
+    plt.ylabel("Average PM2.5")
+
+    plt.tight_layout()
+
+    plt.savefig("Station_Comparison.png")
+    plt.show()
+
+    print("\nCharts saved successfully.")
+
+
+# =====================================================
+# 11. SENTIMENT ANALYSIS
+# =====================================================
+
+POSITIVE = {
+    "good": 1,
+    "clean": 1,
+    "fast": 1,
+    "helpful": 1,
+    "improved": 1,
+    "excellent": 2,
+    "better": 1
+}
+
+NEGATIVE = {
+    "bad": -1,
+    "dirty": -1,
+    "slow": -1,
+    "smoke": -1,
+    "poor": -1,
+    "pollution": -1,
+    "unhelpful": -1
+}
+
+
+def score(text):
+
+    words = text.lower()
+
+    for char in ".,!?;:":
+        words = words.replace(char, " ")
+
+    words = words.split()
+
+    total = 0
+
+    for i, word in enumerate(words):
+
+        value = 0
+
+        if word in POSITIVE:
+            value = POSITIVE[word]
+
+        elif word in NEGATIVE:
+            value = NEGATIVE[word]
+
+        if value != 0:
+
+            previous = words[max(0, i-3):i]
+
+            if any(w in ("not", "never", "no")
+                   for w in previous):
+                value = -value
+
+            total += value
+
+    return total
+
+
+def label(text):
+
+    s = score(text)
+
+    if s > 0:
+        return "positive"
+
+    elif s < 0:
+        return "negative"
+
+    return "neutral"
+
+
+def sentiment_test():
+
+    complaints = [
+        "Roads are clean and the bus was fast.",
+        "Smoke from the factory, air is bad.",
+        "The staff were not helpful.",
+        "Not bad, service improved."
+    ]
+
+    print("\nSENTIMENT ANALYSIS:")
+
+    for complaint in complaints:
+        print("{:8} | {}".format(
+            label(complaint), complaint
+        ))
+
+
+# =====================================================
+# 12. EXTRACTIVE SUMMARISER
+# =====================================================
+
+STOP_WORDS = {
+    "the", "is", "are", "a", "an", "and",
+    "or", "was", "were", "to", "of", "in",
+    "on", "for", "from", "it", "this", "that"
+}
+
+
+def summarise(text, k=2):
+
+    sentences = []
+
+    for sentence in text.replace("!", ".").replace("?", ".").split("."):
+
+        sentence = sentence.strip()
+
+        if sentence:
+            sentences.append(sentence)
+
+    if not sentences:
+        return ""
+
+    counts = Counter()
+
+    for sentence in sentences:
+
+        words = sentence.lower().replace(",", "").split()
+
+        for word in words:
+
+            if word not in STOP_WORDS and len(word) > 2:
+                counts[word] += 1
+
+    scored = []
+
+    for position, sentence in enumerate(sentences):
+
+        words = sentence.lower().replace(",", "").split()
+
+        value = sum(
+            counts[word]
+            for word in words
+            if word not in STOP_WORDS
+        )
+
+        scored.append((value, position, sentence))
+
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    selected = scored[:k]
+    selected.sort(key=lambda x: x[1])
+
+    return ". ".join(x[2] for x in selected) + "."
+
+
+# =====================================================
+# 13. RULE-BASED CHATBOT
+# =====================================================
+
+def chatbot(question, con):
+
+    question = question.lower()
+
+    station = None
+
+    if "adyar" in question:
+        station = "Adyar"
+
+    elif "guindy" in question:
+        station = "Guindy"
+
+    if station is None:
+        return "Please mention Adyar or Guindy."
+
+    cur = con.cursor()
+
+    if "average" in question:
+
+        cur.execute("""
+        SELECT AVG(r.pm25)
+        FROM readings r
+        JOIN stations s
+        ON r.station_id=s.station_id
+        WHERE s.station_name=?
+        """, (station,))
+
+        result = cur.fetchone()[0]
+
+        if result is None:
+            return "No readings available."
+
+        return "Average PM2.5 at {} is {}.".format(
+            station, round(result, 2)
+        )
+
+    cur.execute("""
+    SELECT r.reading_date, r.pm25
+    FROM readings r
+    JOIN stations s
+    ON r.station_id=s.station_id
+    WHERE s.station_name=?
+    ORDER BY r.reading_date DESC
+    LIMIT 1
+    """, (station,))
+
+    result = cur.fetchone()
+
+    if result is None:
+        return "No readings available."
+
+    return "Latest available PM2.5 at {} on {} is {}.".format(
+        station, result[0], result[1]
+    )
+
+
+# =====================================================
+# 14. DEBUGGING AND PROFILING
+# =====================================================
+
+def profiling():
+
+    start = time.perf_counter()
+
+    rows = load_clean(RAW)
+
+    end = time.perf_counter()
+
+    print("\nPROFILING RESULTS")
+
+    print("Valid rows:", len(rows))
+
+    print("Execution time:",
+          round(end - start, 6), "seconds")
+
+    return rows
+
+
+# =====================================================
+# 15. MAIN PROGRAM
+# =====================================================
+
+def main():
+
+    print("=" * 55)
+    print("       AIR QUALITY DATA ANALYSIS SYSTEM")
+    print("=" * 55)
+
+    # Data cleaning
+
+    clean = profiling()
+
+    print("\nCLEANED DATA:")
+
+    for row in clean:
+        print(row)
+
+    # Normalisation
+
+    values = [row[2] for row in clean]
+
+    print("\nMIN-MAX NORMALISATION:")
+    print(min_max(values))
+
+    print("\nZ-SCORE STANDARDISATION:")
+    print(z_score(values))
+
+    # Database
+
+    con = create_database(clean)
+
+    # SQL queries
+
+    print("\n" + "=" * 55)
+    print("DATABASE ANALYSIS")
+    print("=" * 55)
+
+    query_one(con)
+    query_two(con)
+    query_three(con)
+
+    # Python summary
+
+    python_summary(clean)
+
+    # Sentiment analysis
+
+    sentiment_test()
+
+    # Complaint summariser
+
+    complaint = (
+        "The road is dirty. "
+        "Smoke is coming from the factory. "
+        "The air quality is bad."
+    )
+
+    print("\nCOMPLAINT SUMMARISER:")
+    print("Original:", complaint)
+    print("Summary:", summarise(complaint, 2))
+
+    # Chatbot
+
+    print("\nCHATBOT EXAMPLE:")
+
+    print("Question: What is the PM2.5 in Adyar?")
+
+    print("Answer:",
+          chatbot("What is the PM2.5 in Adyar?", con))
+
+    # Charts
+
+    visualise(clean)
+
+    # Interactive chatbot
+
+    print("\nINTERACTIVE CHATBOT")
+    print("Ask about Adyar or Guindy.")
+    print("Type exit to stop.")
+
+    while True:
+
+        question = input("\nYou: ").strip()
+
+        if question.lower() in ("exit", "quit", "stop"):
+
+            print("Chatbot: Program completed.")
+            break
+
+        if question == "":
+            print("Chatbot: Enter a question.")
+        else:
+            print("Chatbot:", chatbot(question, con))
+
+    con.close()
+
+
+# =====================================================
+# PROGRAM START
+# =====================================================
+
+if __name__ == "__main__":
+    main()
 
